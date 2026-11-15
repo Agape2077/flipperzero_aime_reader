@@ -1,0 +1,17 @@
+App(
+    appid="flip_aime_reader",
+    name="Aime Reader",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flip_aime_reader_app",
+    stack_size=8 * 1024,
+    fap_category="NFC",
+    fap_version=(1, 1),
+    fap_author="AimeDev",
+    fap_description="SEGA Aime / Amusement IC USB Reader",
+    fap_icon="icon.png",
+    requires=[
+        "gui",
+        "nfc",
+        "notification",
+    ],
+)
