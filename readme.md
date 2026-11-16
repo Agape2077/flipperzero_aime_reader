@@ -22,6 +22,15 @@ aime_bridge/
 └── README.md
 ```
 
+## usage
+
+open and modify your `XXgatools.ini`
+```ini
+[AIME]
+Enable=0
+```
+
+
 ## Compilation and Flashing
 
 Requires Python and uFBT:
