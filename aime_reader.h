@@ -129,6 +129,8 @@ typedef union {
 
 typedef struct {
     bool high_baudrate;
+    // true: AIC Lite/Lite-S -> virtual MIFARE; false: native FeliCa IDm + PMm
+    bool aic_as_mifare;
     bool usb_connected;
     bool is_polling;
     uint8_t led_r;
@@ -145,7 +147,9 @@ typedef struct AimeReader AimeReader;
 AimeReader* aime_reader_alloc(void);
 void aime_reader_free(AimeReader* instance);
 void aime_reader_get_state(AimeReader* instance, AimeReaderState* out_state);
-void aime_reader_toggle_baudrate(AimeReader* instance);
+void aime_reader_set_baudrate(AimeReader* instance, bool high_baudrate);
+// Selects only the output mode for FeliCa AIC cards; physical MIFARE polling is unchanged.
+void aime_reader_set_aic_as_mifare(AimeReader* instance, bool enable);
 
 #ifdef __cplusplus
 }
