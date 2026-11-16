@@ -270,23 +270,65 @@ struct AimeReader {
 // Aime Sector 0 template. Only Block 0 UID/BCC are generated per detected card.
 // These constants are based on the Aime sample dump supplied for this project.
 static const uint8_t aime_sector0_block0_template[16] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x04, 0x00,
-    0xC8, 0x02, 0x00, 0x20, 0x00, 0x00, 0x00, 0x18,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x88,
+    0x04,
+    0x00,
+    0xC8,
+    0x02,
+    0x00,
+    0x20,
+    0x00,
+    0x00,
+    0x00,
+    0x18,
 };
 
 static const uint8_t aime_sector0_block1_template[16] = {
-    0x53, 0x42, 0x53, 0x44, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x4F, 0x83, 0xE0,
+    0x53,
+    0x42,
+    0x53,
+    0x44,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x4F,
+    0x83,
+    0xE0,
 };
 
 static const uint8_t aime_sector0_block3_template[16] = {
-    0x57, 0x43, 0x43, 0x46, 0x76, 0x32, 0x70, 0xF8,
-    0x78, 0x11, 0x57, 0x43, 0x43, 0x46, 0x76, 0x32,
+    0x57,
+    0x43,
+    0x43,
+    0x46,
+    0x76,
+    0x32,
+    0x70,
+    0xF8,
+    0x78,
+    0x11,
+    0x57,
+    0x43,
+    0x43,
+    0x46,
+    0x76,
+    0x32,
 };
 
-#define AIME_SETTINGS_FILE APP_DATA_PATH("settings.bin")
-#define AIME_SETTINGS_SIZE 7U
-#define AIME_SETTINGS_VERSION 1U
+#define AIME_SETTINGS_FILE      APP_DATA_PATH("settings.bin")
+#define AIME_SETTINGS_SIZE      7U
+#define AIME_SETTINGS_VERSION   1U
 #define AIME_SETTINGS_CHECK_XOR 0xA5U
 
 static uint8_t aime_settings_checksum(const uint8_t* data) {
@@ -512,8 +554,7 @@ static NfcCommand felica_poll_cb(NfcGenericEvent event, void* context) {
                 memcpy(ctx->pmm, f_data->pmm.data, sizeof(ctx->pmm));
                 ctx->got_card = true;
 
-                const bool is_lite =
-                    (f_data->pmm.data[1] == 0xF0 || f_data->pmm.data[1] == 0xF1);
+                const bool is_lite = (f_data->pmm.data[1] == 0xF0 || f_data->pmm.data[1] == 0xF1);
                 if(ctx->read_spad && is_lite) {
                     const FelicaBlock* spad0 = &f_data->data.fs.spad[0];
                     // The poller uses Incomplete when unauthenticated Lite blocks were read.
@@ -526,8 +567,7 @@ static NfcCommand felica_poll_cb(NfcGenericEvent event, void* context) {
             }
             furi_semaphore_release(ctx->app->nfc_done_sem);
             return NfcCommandStop;
-        } else if(
-            ev->type == FelicaPollerEventTypeError) {
+        } else if(ev->type == FelicaPollerEventTypeError) {
             furi_semaphore_release(ctx->app->nfc_done_sem);
             return NfcCommandStop;
         }
@@ -588,7 +628,7 @@ static int32_t aime_nfc_thread(void* context) {
                 NfcPoller* poller = nfc_poller_alloc(nfc, NfcProtocolMfClassic);
                 if(poller) {
                     nfc_poller_start(poller, mf_read_poll_cb, &ctx);
-                    furi_semaphore_acquire(instance->nfc_done_sem, 400);
+                    furi_semaphore_acquire(instance->nfc_done_sem, 800);
                     nfc_poller_stop(poller);
 
                     const MfClassicData* data = nfc_poller_get_data(poller);
@@ -854,7 +894,7 @@ static void aime_handle_mifare_read(AimeReader* instance) {
     instance->mifare_read_req = true;
     // Wake the NFC worker so it can stop the current scan and service this read.
     furi_semaphore_release(instance->nfc_done_sem);
-    furi_semaphore_acquire(instance->mifare_read_sem, 450);
+    furi_semaphore_acquire(instance->mifare_read_sem, 1000);
 
     if(instance->mifare_read_ok) {
         aime_res_init(instance, 0x10);
