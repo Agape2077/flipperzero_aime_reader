@@ -9,6 +9,15 @@
 extern "C" {
 #endif
 
+// 虚拟卡加载结果
+typedef enum {
+    VirtualCardResultOk = 0,
+    VirtualCardResultFileNotFound,
+    VirtualCardResultParseFail,       // 文件格式不识别
+    VirtualCardResultNotAimeCard,     // MIFARE: 不是 Aime/Banapassport 卡
+    VirtualCardResultMissingBlocks,   // MIFARE: 关键块数据缺失或含 ??
+} VirtualCardResult;
+
 // 高波特率模式 (837-15396 / 115200) 参数
 #define AIME_HIGH_BAUDRATE   115200
 #define AIME_HIGH_FW_VERSION "\x94"
@@ -140,6 +149,9 @@ typedef struct {
     char card_type[24];
     char card_id[32];
     char access_code[32];
+    // 文件模拟状态显示
+    bool file_virtual_active;      // 当前是否有虚拟卡激活
+    char file_virtual_name[48];    // 激活的文件名（用于显示）
 } AimeReaderState;
 
 typedef struct AimeReader AimeReader;
@@ -150,6 +162,16 @@ void aime_reader_get_state(AimeReader* instance, AimeReaderState* out_state);
 void aime_reader_set_baudrate(AimeReader* instance, bool high_baudrate);
 // Selects only the output mode for FeliCa AIC cards; physical MIFARE polling is unchanged.
 void aime_reader_set_aic_as_mifare(AimeReader* instance, bool enable);
+
+// 从 .nfc 转储文件加载虚拟卡片。
+// path: Flipper 文件系统路径（例如 /ext/nfc/my_aime.nfc）
+// 返回 VirtualCardResult，成功时立即将虚拟卡注入为当前卡片。
+// 调用 aime_reader_clear_virtual_card() 可撤销模拟。
+VirtualCardResult aime_reader_load_virtual_card(AimeReader* instance, const char* path);
+void aime_reader_clear_virtual_card(AimeReader* instance);
+
+// 启动 5 秒自动卸载虚拟卡的计时器（5s后自动恢复物理卡扫描）
+void aime_reader_arm_virtual_card_timer(AimeReader* instance);
 
 #ifdef __cplusplus
 }

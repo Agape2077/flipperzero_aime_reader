@@ -260,6 +260,21 @@ struct AimeReader {
     bool auth_a_ready;
     bool auth_b_ready;
 
+    // 文件虚拟卡状态（.nfc 转储模拟）
+    volatile bool file_virtual_active; // 当前有激活的文件虚拟卡
+    bool file_virtual_is_felica;       // true=按原生 FeliCa 输出，false=按 MIFARE 输出
+    bool file_virtual_has_mf_blocks;   // 仅 Mifare Classic 转储：块数据可用
+    FuriTimer* virtual_umount_timer;   // 5秒自动卸载计时器
+    volatile bool virtual_umount_requested; // 定时器只置位，由 NFC 线程执行卸载
+    uint32_t virtual_umount_generation;     // 定时器对应的虚拟卡代号
+    uint32_t virtual_card_generation;       // 每次加载/卸载递增
+    // MIFARE 文件虚拟：全量 64 块数据（1K），block_valid[i] 表示该块有有效数据
+    uint8_t virt_mf_blocks[64][16];
+    bool virt_mf_block_valid[64];
+    // FeliCa 文件虚拟：IDm + PMm
+    uint8_t virt_felica_idm[8];
+    uint8_t virt_felica_pmm[8];
+
     // UI 状态
     AimeReaderState state;
     uint8_t last_r;
@@ -330,6 +345,422 @@ static const uint8_t aime_sector0_block3_template[16] = {
 #define AIME_SETTINGS_SIZE      7U
 #define AIME_SETTINGS_VERSION   1U
 #define AIME_SETTINGS_CHECK_XOR 0xA5U
+
+// --- .nfc 文件虚拟卡解析 ---
+
+// Aime/Banapassport 验证签名：Sector 0 Block 3 Key B = "WCCFv2"
+static const uint8_t aime_keyb_sig[6] = {0x57, 0x43, 0x43, 0x46, 0x76, 0x32};
+
+// 将单个十六进制字符转换为数值，非法字符返回 0xFF
+static uint8_t nfc_hex_digit(char c) {
+    if(c >= '0' && c <= '9') return (uint8_t)(c - '0');
+    if(c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+    if(c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+    return 0xFF;
+}
+
+// 解析空格分隔的十六进制字节串到 buf（最多 max_bytes 字节）
+// 若遇到 "??" 返回 false；成功返回 true
+static bool nfc_parse_hex_bytes(const char* str, uint8_t* buf, size_t max_bytes, size_t* out_len) {
+    size_t idx = 0;
+    const char* p = str;
+    while(*p && idx < max_bytes) {
+        while(*p == ' ') p++;
+        if(!*p) break;
+        if(p[0] == '?' && p[1] == '?') return false;
+        char hi = p[0], lo = p[1];
+        if(!hi || !lo) break;
+        uint8_t h = nfc_hex_digit(hi), l = nfc_hex_digit(lo);
+        if(h == 0xFF || l == 0xFF) break;
+        buf[idx++] = (uint8_t)((h << 4) | l);
+        p += 2;
+        if(*p == ' ') p++;
+    }
+    if(out_len) *out_len = idx;
+    return true;
+}
+
+// 从行中去掉前缀，返回值部分（指针），若前缀不匹配返回 NULL
+static const char* nfc_line_value(const char* line, const char* prefix) {
+    size_t plen = strlen(prefix);
+    if(strncmp(line, prefix, plen) == 0) {
+        return line + plen;
+    }
+    return NULL;
+}
+
+// 去除字符串末尾的 \r\n 和空格
+static void nfc_rtrim(char* s) {
+    int len = (int)strlen(s);
+    while(len > 0 && (s[len - 1] == '\r' || s[len - 1] == '\n' || s[len - 1] == ' ')) {
+        s[--len] = '\0';
+    }
+}
+
+// 按行读取 .nfc 文件（分块读取，避免逐字节 IO 过慢）
+typedef struct {
+    uint8_t buf[256];
+    size_t pos;
+    size_t len;
+    bool eof;
+} NfcLineReader;
+
+static bool nfc_reader_next_line(File* file, NfcLineReader* reader, char* line, size_t cap) {
+    size_t line_pos = 0;
+    bool got_any = false;
+
+    while(true) {
+        if(reader->pos >= reader->len) {
+            if(reader->eof) {
+                if(!got_any) return false;
+                break;
+            }
+            reader->len = storage_file_read(file, reader->buf, sizeof(reader->buf));
+            reader->pos = 0;
+            if(reader->len == 0) {
+                reader->eof = true;
+                if(!got_any) return false;
+                break;
+            }
+        }
+
+        char ch = (char)reader->buf[reader->pos++];
+        got_any = true;
+        if(ch == '\n') break;
+        if(ch != '\r' && line_pos < cap - 1) line[line_pos++] = ch;
+    }
+
+    line[line_pos] = '\0';
+    nfc_rtrim(line);
+    return got_any;
+}
+
+// AIC 的 Access Code 是 10 字节 BCD；解密结果不是 BCD 说明不是 AIC 卡 / S-PAD 0 无效
+static bool aic_access_code_is_valid(const uint8_t* bcd) {
+    bool nonzero = false;
+    for(size_t i = 0; i < 10; i++) {
+        if((bcd[i] >> 4) > 9 || (bcd[i] & 0x0F) > 9) return false;
+        if(bcd[i] != 0) nonzero = true;
+    }
+    return nonzero;
+}
+
+// FeliCa Lite / Lite-S / Link(Lite-S mode) 的 PMm[1] 取值
+static bool felica_pmm_is_lite(const uint8_t* pmm) {
+    return pmm[1] == 0xF0 || pmm[1] == 0xF1 || pmm[1] == 0xF2;
+}
+
+VirtualCardResult aime_reader_load_virtual_card(AimeReader* instance, const char* path) {
+    if(!instance || !path) return VirtualCardResultParseFail;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return VirtualCardResultParseFail;
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        furi_record_close(RECORD_STORAGE);
+        return VirtualCardResultParseFail;
+    }
+
+    if(!storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+        return VirtualCardResultFileNotFound;
+    }
+
+    // ---- 解析状态 ----
+    typedef enum { NfcTypeUnknown, NfcTypeMifareClassic, NfcTypeFelica } NfcFileType;
+    NfcFileType nfc_type = NfcTypeUnknown;
+
+    uint8_t uid[10] = {0};
+    size_t uid_len = 0;
+    uint8_t felica_idm[8] = {0};
+    uint8_t felica_pmm[8] = {0};
+    bool got_idm = false, got_pmm = false;
+    uint8_t felica_spad0[16] = {0};
+    bool got_felica_spad0 = false;
+
+    // MIFARE 块缓冲（1K = 64 块）
+    uint8_t mf_blocks[64][16];
+    bool mf_block_valid[64];
+    memset(mf_blocks, 0, sizeof(mf_blocks));
+    memset(mf_block_valid, 0, sizeof(mf_block_valid));
+
+    char line[160];
+    NfcLineReader line_reader = {0};
+
+    // 分块读取并按行处理
+    while(nfc_reader_next_line(file, &line_reader, line, sizeof(line))) {
+        const char* val;
+
+        // Device type
+        if((val = nfc_line_value(line, "Device type: ")) != NULL) {
+            if(strcmp(val, "Mifare Classic") == 0 || strcmp(val, "MIFARE Classic") == 0) {
+                nfc_type = NfcTypeMifareClassic;
+            } else if(strcmp(val, "FeliCa") == 0) {
+                nfc_type = NfcTypeFelica;
+            }
+        }
+        // UID (MIFARE / FeliCa)
+        else if((val = nfc_line_value(line, "UID: ")) != NULL) {
+            nfc_parse_hex_bytes(val, uid, sizeof(uid), &uid_len);
+            if(uid_len == 8 && !got_idm) {
+                memcpy(felica_idm, uid, 8);
+                got_idm = true;
+            }
+        }
+        // IDm (FeliCa) / Manufacture id:
+        else if((val = nfc_line_value(line, "IDm: ")) != NULL ||
+                (val = nfc_line_value(line, "Manufacture id: ")) != NULL) {
+            size_t n = 0;
+            if(nfc_parse_hex_bytes(val, felica_idm, 8, &n) && n == 8) got_idm = true;
+        }
+        // PMm (FeliCa) / Manufacture parameter:
+        else if((val = nfc_line_value(line, "PMm: ")) != NULL ||
+                (val = nfc_line_value(line, "Manufacture parameter: ")) != NULL) {
+            size_t n = 0;
+            if(nfc_parse_hex_bytes(val, felica_pmm, 8, &n) && n == 8) got_pmm = true;
+        }
+        // Block N:
+        else if(strncmp(line, "Block ", 6) == 0) {
+            int blk = -1;
+            const char* colon = strchr(line + 6, ':');
+            if(colon) {
+                blk = 0;
+                for(const char* d = line + 6; d < colon; d++) {
+                    if(*d >= '0' && *d <= '9') blk = blk * 10 + (*d - '0');
+                }
+                if(blk >= 0 && blk < 64) {
+                    const char* hex = colon + 1;
+                    while(*hex == ' ') hex++;
+
+                    uint8_t raw_block[20];
+                    size_t n = 0;
+                    if(nfc_parse_hex_bytes(hex, raw_block, sizeof(raw_block), &n)) {
+                        // FeliCa Lite dump 为 2 字节状态码 (SF1/SF2) + 16 字节数据 = 18 字节
+                        if(n == 18) {
+                            if(blk == 0) {
+                                memcpy(felica_spad0, &raw_block[2], 16);
+                                got_felica_spad0 = true;
+                            }
+                        } else if(n == 16) {
+                            if(blk == 0) {
+                                memcpy(felica_spad0, raw_block, 16);
+                                got_felica_spad0 = true;
+                            }
+                            memcpy(mf_blocks[blk], raw_block, 16);
+                            mf_block_valid[blk] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+
+    // ---- 结果处理 ----
+
+    if(nfc_type == NfcTypeFelica) {
+        if(!got_idm || !got_pmm) return VirtualCardResultParseFail;
+
+        // 获取当前 aic_as_mifare 设置
+        furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+        bool aic_emulate = instance->state.aic_as_mifare;
+        furi_mutex_release(instance->state_mutex);
+
+        // 从 path 提取文件名用于显示
+        const char* slash = strrchr(path, '/');
+        const char* fname = slash ? slash + 1 : path;
+
+        // 只有 FeliCa Lite/Lite-S 才可能带 AIC 的 S-PAD 0。
+        // 解密后必须是合法 10 字节 BCD Access Code，否则按非 AIC 卡处理。
+        uint8_t decrypted[16] = {0};
+        bool spad_valid = false;
+        if(got_felica_spad0 && felica_pmm_is_lite(felica_pmm)) {
+            aic_decrypt_spad_0(felica_spad0, decrypted);
+            spad_valid = aic_access_code_is_valid(&decrypted[6]);
+        }
+
+        // 设置决定输出方式；但非 AIC / 无有效 S-PAD 0 时强制只回 IDm/PMm
+        bool emulate_mifare = aic_emulate && spad_valid;
+
+        // 新卡生效前取消上一张卡的自动卸载计时
+        if(instance->virtual_umount_timer) {
+            furi_timer_stop(instance->virtual_umount_timer);
+        }
+        instance->virtual_umount_requested = false;
+
+        furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+        instance->file_virtual_active = true;
+        instance->file_virtual_is_felica = !emulate_mifare;
+        instance->file_virtual_has_mf_blocks = false;
+        instance->virtual_card_generation++;
+        instance->state.file_virtual_active = true;
+        memcpy(instance->virt_felica_idm, felica_idm, 8);
+        memcpy(instance->virt_felica_pmm, felica_pmm, 8);
+        memcpy(instance->cached_idm, felica_idm, 8);
+        memcpy(instance->cached_pmm, felica_pmm, 8);
+        snprintf(instance->state.file_virtual_name, sizeof(instance->state.file_virtual_name),
+                 "%s", fname);
+
+        if(emulate_mifare) {
+            // 情况1: 有有效 S-PAD 0 且设置为 MIFARE Emu -> 伪装成 MIFARE Classic
+            instance->card_present = CardPresentMifare;
+            instance->is_virtual_mifare = true;
+            instance->cached_uid_len = 4;
+            memcpy(instance->cached_uid, &felica_idm[4], 4);
+            memcpy(instance->virtual_ac_bcd, &decrypted[6], 10);
+
+            snprintf(instance->state.card_type, sizeof(instance->state.card_type),
+                     "AIC -> MIFARE (File)");
+            snprintf(instance->state.card_id, sizeof(instance->state.card_id),
+                     "IDm:%02X%02X%02X%02X%02X%02X%02X%02X",
+                     felica_idm[0], felica_idm[1], felica_idm[2], felica_idm[3],
+                     felica_idm[4], felica_idm[5], felica_idm[6], felica_idm[7]);
+            snprintf(instance->state.access_code, sizeof(instance->state.access_code),
+                     "%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X",
+                     decrypted[6],  decrypted[7],  decrypted[8],  decrypted[9],
+                     decrypted[10], decrypted[11], decrypted[12], decrypted[13],
+                     decrypted[14], decrypted[15]);
+        } else {
+            // 情况2: 设置为 Native FeliCa，或这张卡没有详细块 / 不是 AIC 卡
+            // 无视设置，只回 IDm / PMm
+            instance->card_present = CardPresentFelica;
+            instance->is_virtual_mifare = false;
+
+            snprintf(instance->state.card_type, sizeof(instance->state.card_type),
+                     "FeliCa Native (File)");
+            snprintf(instance->state.card_id, sizeof(instance->state.card_id),
+                     "IDm:%02X%02X%02X%02X%02X%02X%02X%02X",
+                     felica_idm[0], felica_idm[1], felica_idm[2], felica_idm[3],
+                     felica_idm[4], felica_idm[5], felica_idm[6], felica_idm[7]);
+            snprintf(instance->state.access_code, sizeof(instance->state.access_code),
+                     "PMm:%02X%02X%02X%02X%02X%02X%02X%02X",
+                     felica_pmm[0], felica_pmm[1], felica_pmm[2], felica_pmm[3],
+                     felica_pmm[4], felica_pmm[5], felica_pmm[6], felica_pmm[7]);
+        }
+        furi_mutex_release(instance->state_mutex);
+        return VirtualCardResultOk;
+    }
+
+    if(nfc_type == NfcTypeMifareClassic) {
+        // 验证：Sector 0 Block 3 Key B（字节 [10..15]）== "WCCFv2"
+        if(!mf_block_valid[3]) return VirtualCardResultMissingBlocks;
+        if(memcmp(&mf_blocks[3][10], aime_keyb_sig, 6) != 0) return VirtualCardResultNotAimeCard;
+
+        // Block 0 和 Block 2 必须有效
+        if(!mf_block_valid[0] || !mf_block_valid[2]) return VirtualCardResultMissingBlocks;
+
+        // 读取 UID（从 Block 0 前 uid_len 字节，或直接用头部 UID 字段）
+        if(uid_len == 0 || uid_len > 7) return VirtualCardResultParseFail;
+
+        // 从 Block 2 [6..15] 提取 Access Code（10 字节）
+        uint8_t ac_bcd[10];
+        memcpy(ac_bcd, &mf_blocks[2][6], 10);
+
+        const char* slash = strrchr(path, '/');
+        const char* fname = slash ? slash + 1 : path;
+
+        // 新卡生效前取消上一张卡的自动卸载计时
+        if(instance->virtual_umount_timer) {
+            furi_timer_stop(instance->virtual_umount_timer);
+        }
+        instance->virtual_umount_requested = false;
+
+        furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+        instance->file_virtual_active = true;
+        instance->file_virtual_is_felica = false;
+        instance->file_virtual_has_mf_blocks = true;
+        instance->virtual_card_generation++;
+        memcpy(instance->virt_mf_blocks, mf_blocks, sizeof(mf_blocks));
+        memcpy(instance->virt_mf_block_valid, mf_block_valid, sizeof(mf_block_valid));
+        // 注入为 MIFARE 虚拟卡
+        instance->card_present = CardPresentMifare;
+        instance->is_virtual_mifare = true;
+        instance->cached_uid_len = (uint8_t)uid_len;
+        memcpy(instance->cached_uid, uid, uid_len);
+        memcpy(instance->virtual_ac_bcd, ac_bcd, 10);
+        instance->state.file_virtual_active = true;
+        snprintf(instance->state.file_virtual_name, sizeof(instance->state.file_virtual_name),
+                 "%s", fname);
+        snprintf(instance->state.card_type, sizeof(instance->state.card_type),
+                 "MIFARE (File)");
+        snprintf(instance->state.card_id, sizeof(instance->state.card_id),
+                 "UID: %02X %02X %02X %02X",
+                 uid[0], uid[1], uid[2], uid[3]);
+        snprintf(instance->state.access_code, sizeof(instance->state.access_code),
+                 "%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X",
+                 ac_bcd[0], ac_bcd[1], ac_bcd[2], ac_bcd[3], ac_bcd[4],
+                 ac_bcd[5], ac_bcd[6], ac_bcd[7], ac_bcd[8], ac_bcd[9]);
+        furi_mutex_release(instance->state_mutex);
+        return VirtualCardResultOk;
+    }
+
+    return VirtualCardResultParseFail;
+}
+
+static void aime_clear_virtual_card_state_locked(AimeReader* instance) {
+    instance->file_virtual_active = false;
+    instance->file_virtual_is_felica = false;
+    instance->file_virtual_has_mf_blocks = false;
+    instance->virtual_card_generation++;
+    instance->virtual_umount_generation = instance->virtual_card_generation;
+    instance->card_present = CardPresentNone;
+    instance->is_virtual_mifare = false;
+    instance->state.file_virtual_active = false;
+    instance->state.file_virtual_name[0] = '\0';
+    snprintf(instance->state.card_type, sizeof(instance->state.card_type), "Waiting for card...");
+    snprintf(instance->state.card_id, sizeof(instance->state.card_id), "Tap Aime / AIC / Phone");
+    instance->state.access_code[0] = '\0';
+}
+
+void aime_reader_clear_virtual_card(AimeReader* instance) {
+    if(!instance) return;
+
+    // 注意：本函数不能在 virtual_umount_timer 的回调内执行。
+    // furi_timer_stop 是同步等待 timer 队列的调用，在 timer 回调里会死锁。
+    if(instance->virtual_umount_timer) {
+        furi_timer_stop(instance->virtual_umount_timer);
+    }
+    instance->virtual_umount_requested = false;
+
+    furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+    aime_clear_virtual_card_state_locked(instance);
+    furi_mutex_release(instance->state_mutex);
+}
+
+static void virtual_umount_timer_callback(void* context) {
+    AimeReader* instance = context;
+    if(instance) {
+        // 只置位，不做任何阻塞操作；真正的卸载由 NFC 线程完成。
+        // 在 timer 回调里调用 furi_timer_stop / 获取 mutex 会死锁。
+        instance->virtual_umount_requested = true;
+    }
+}
+
+void aime_reader_arm_virtual_card_timer(AimeReader* instance) {
+    if(!instance) return;
+    if(!instance->virtual_umount_timer) {
+        instance->virtual_umount_timer =
+            furi_timer_alloc(virtual_umount_timer_callback, FuriTimerTypeOnce, instance);
+    }
+    if(!instance->virtual_umount_timer) return;
+
+    // 先停掉上一张卡的计时，再绑定到当前卡片代号
+    furi_timer_stop(instance->virtual_umount_timer);
+
+    furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+    instance->virtual_umount_generation = instance->virtual_card_generation;
+    instance->virtual_umount_requested = false;
+    furi_mutex_release(instance->state_mutex);
+
+    // 5 秒后自动卸载虚拟卡
+    furi_timer_start(instance->virtual_umount_timer, furi_ms_to_ticks(5000));
+}
+
 
 static uint8_t aime_settings_checksum(const uint8_t* data) {
     uint8_t checksum = AIME_SETTINGS_CHECK_XOR;
@@ -617,6 +1048,20 @@ static int32_t aime_nfc_thread(void* context) {
     uint8_t miss_count = 0;
 
     while(instance->running) {
+        // 0. 文件虚拟卡自动卸载（定时器只置位，这里执行实际清理）
+        if(instance->virtual_umount_requested) {
+            furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+            if(instance->virtual_umount_requested) {
+                instance->virtual_umount_requested = false;
+                // 代号不一致说明期间已加载了新的虚拟卡，不能误删
+                if(instance->file_virtual_active &&
+                   instance->virtual_umount_generation == instance->virtual_card_generation) {
+                    aime_clear_virtual_card_state_locked(instance);
+                }
+            }
+            furi_mutex_release(instance->state_mutex);
+        }
+
         // 1. 物理 MIFARE 读块请求
         if(instance->mifare_read_req) {
             PollSyncCtx ctx = {.app = instance, .got_card = false};
@@ -653,12 +1098,22 @@ static int32_t aime_nfc_thread(void* context) {
         furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
         bool polling = instance->state.is_polling;
         bool aic_emulate = instance->state.aic_as_mifare;
+        bool file_virt = instance->file_virtual_active;
         furi_mutex_release(instance->state_mutex);
 
         if(!polling) {
-            instance->card_present = CardPresentNone;
-            instance->is_virtual_mifare = false;
+            // 仅当没有文件虚拟卡激活时才清除卡片状态
+            if(!file_virt) {
+                instance->card_present = CardPresentNone;
+                instance->is_virtual_mifare = false;
+            }
             furi_delay_ms(40);
+            continue;
+        }
+
+        // 文件虚拟卡激活时跳过物理 NFC 扫描，直接保持注入的卡片状态
+        if(file_virt) {
+            furi_delay_ms(50);
             continue;
         }
 
@@ -820,8 +1275,14 @@ static int32_t aime_nfc_thread(void* context) {
 
         if(!ctx.got_card) {
             if(++miss_count >= 3) {
-                instance->card_present = CardPresentNone;
-                instance->is_virtual_mifare = false;
+                // 只清物理卡状态，不覆盖文件虚拟卡
+                furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+                bool fv = instance->file_virtual_active;
+                furi_mutex_release(instance->state_mutex);
+                if(!fv) {
+                    instance->card_present = CardPresentNone;
+                    instance->is_virtual_mifare = false;
+                }
             }
             scan_felica_turn = !scan_felica_turn;
         }
@@ -856,9 +1317,36 @@ static void aime_handle_card_detect(AimeReader* instance) {
     furi_mutex_release(instance->state_mutex);
 }
 
+static void aime_build_synthetic_mifare_block(
+    AimeReader* instance,
+    uint8_t block_no,
+    const uint8_t* uid,
+    const uint8_t* ac_bcd) {
+    aime_res_init(instance, 0x10);
+    memset(instance->res.block, 0x00, 16);
+
+    if(block_no == 0) {
+        memcpy(instance->res.block, aime_sector0_block0_template, 16);
+        memcpy(instance->res.block, uid, 4);
+        instance->res.block[4] = uid[0] ^ uid[1] ^ uid[2] ^ uid[3];
+    } else if(block_no == 1) {
+        memcpy(instance->res.block, aime_sector0_block1_template, 16);
+    } else if(block_no == 2) {
+        // Aime Block 2 [6..15] 保存 10 字节 Access Code。
+        memcpy(&instance->res.block[6], ac_bcd, 10);
+    } else if(block_no == 3) {
+        // Sector Trailer 模板来自 Aime 样本；认证密钥仍由主机的 KEY_SET 命令管理。
+        memcpy(instance->res.block, aime_sector0_block3_template, 16);
+    }
+}
+
 static void aime_handle_mifare_read(AimeReader* instance) {
     furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+    bool file_active = instance->file_virtual_active;
+    bool file_native_felica = instance->file_virtual_is_felica;
+    bool file_has_mf_blocks = instance->file_virtual_has_mf_blocks;
     bool is_virtual = instance->is_virtual_mifare && (instance->card_present == CardPresentMifare);
+    CardPresentType present = instance->card_present;
     uint8_t block_no = instance->req.block_no;
     uint8_t uid[4];
     uint8_t ac_bcd[10];
@@ -866,23 +1354,58 @@ static void aime_handle_mifare_read(AimeReader* instance) {
     memcpy(ac_bcd, instance->virtual_ac_bcd, 10);
     furi_mutex_release(instance->state_mutex);
 
-    if(is_virtual) {
-        aime_res_init(instance, 0x10);
-        memset(instance->res.block, 0x00, 16);
-
-        if(block_no == 0) {
-            memcpy(instance->res.block, aime_sector0_block0_template, 16);
-            memcpy(instance->res.block, uid, 4);
-            instance->res.block[4] = uid[0] ^ uid[1] ^ uid[2] ^ uid[3];
-        } else if(block_no == 1) {
-            memcpy(instance->res.block, aime_sector0_block1_template, 16);
-        } else if(block_no == 2) {
-            // Aime Block 2 [6..15] 保存 10 字节 Access Code。
-            memcpy(&instance->res.block[6], ac_bcd, 10);
-        } else if(block_no == 3) {
-            // Sector Trailer 模板来自 Aime 样本；认证密钥仍由主机的 KEY_SET 命令管理。
-            memcpy(instance->res.block, aime_sector0_block3_template, 16);
+    // --- 文件虚拟卡（MIFARE 输出方式）---
+    if(file_active && !file_native_felica) {
+        if(file_has_mf_blocks) {
+            // Mifare Classic 转储：直接回放预加载块
+            if(block_no < 64 && instance->virt_mf_block_valid[block_no]) {
+                aime_res_init(instance, 0x10);
+                memcpy(instance->res.block, instance->virt_mf_blocks[block_no], 16);
+                // Block 2 access code 更新 UI
+                if(block_no == 2) {
+                    furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+                    snprintf(
+                        instance->state.access_code,
+                        sizeof(instance->state.access_code),
+                        "%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X",
+                        instance->virt_mf_blocks[2][6],  instance->virt_mf_blocks[2][7],
+                        instance->virt_mf_blocks[2][8],  instance->virt_mf_blocks[2][9],
+                        instance->virt_mf_blocks[2][10], instance->virt_mf_blocks[2][11],
+                        instance->virt_mf_blocks[2][12], instance->virt_mf_blocks[2][13],
+                        instance->virt_mf_blocks[2][14], instance->virt_mf_blocks[2][15]);
+                    furi_mutex_release(instance->state_mutex);
+                }
+            } else {
+                aime_res_init(instance, 0);
+                instance->res.status = STATUS_CARD_ERROR;
+            }
+        } else {
+            // FeliCa(AIC) -> MIFARE：没有 MIFARE 块数据，使用 Aime 合成模板
+            aime_build_synthetic_mifare_block(instance, block_no, uid, ac_bcd);
+            if(block_no == 2) {
+                furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
+                snprintf(
+                    instance->state.access_code,
+                    sizeof(instance->state.access_code),
+                    "%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X",
+                    ac_bcd[0], ac_bcd[1], ac_bcd[2], ac_bcd[3], ac_bcd[4],
+                    ac_bcd[5], ac_bcd[6], ac_bcd[7], ac_bcd[8], ac_bcd[9]);
+                furi_mutex_release(instance->state_mutex);
+            }
         }
+        return;
+    }
+
+    // 原生 FeliCa 虚拟卡不应收到 MIFARE 读块请求
+    if(file_active && file_native_felica) {
+        aime_res_init(instance, 0);
+        instance->res.status = STATUS_CARD_ERROR;
+        return;
+    }
+
+    // 物理 AIC 卡转 MIFARE（未加载文件）
+    if(is_virtual && present == CardPresentMifare) {
+        aime_build_synthetic_mifare_block(instance, block_no, uid, ac_bcd);
         return;
     }
 
@@ -968,8 +1491,10 @@ static void aime_dispatch_command(AimeReader* instance, uint8_t cmd_status) {
         aime_res_init(instance, 0);
         furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
         instance->state.is_polling = false;
-        instance->card_present = CardPresentNone;
-        instance->is_virtual_mifare = false;
+        if(!instance->file_virtual_active) {
+            instance->card_present = CardPresentNone;
+            instance->is_virtual_mifare = false;
+        }
         furi_mutex_release(instance->state_mutex);
         break;
 
@@ -1151,6 +1676,8 @@ AimeReader* aime_reader_alloc(void) {
     instance->state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     instance->nfc_done_sem = furi_semaphore_alloc(1, 0);
     instance->mifare_read_sem = furi_semaphore_alloc(1, 0);
+    instance->virtual_umount_timer =
+        furi_timer_alloc(virtual_umount_timer_callback, FuriTimerTypeOnce, instance);
 
     // Defaults are used only when no valid settings file exists.
     instance->state.high_baudrate = true;
@@ -1206,6 +1733,10 @@ void aime_reader_free(AimeReader* instance) {
     furi_thread_free(instance->nfc_thread);
 
     aime_set_led(instance, 0x00, 0x00, 0x00, true);
+    if(instance->virtual_umount_timer) {
+        furi_timer_stop(instance->virtual_umount_timer);
+        furi_timer_free(instance->virtual_umount_timer);
+    }
     CliVcp* cli_vcp = furi_record_open(RECORD_CLI_VCP);
     cli_vcp_enable(cli_vcp);
     furi_record_close(RECORD_CLI_VCP);
@@ -1245,8 +1776,11 @@ void aime_reader_set_aic_as_mifare(AimeReader* instance, bool enable) {
     if(!instance) return;
     furi_mutex_acquire(instance->state_mutex, FuriWaitForever);
     instance->state.aic_as_mifare = enable;
-    instance->card_present = CardPresentNone;
-    instance->is_virtual_mifare = false;
+    // 文件虚拟卡已加载时不要清掉注入的卡片状态；切换设置只影响之后加载的卡
+    if(!instance->file_virtual_active) {
+        instance->card_present = CardPresentNone;
+        instance->is_virtual_mifare = false;
+    }
     furi_mutex_release(instance->state_mutex);
     if(!aime_settings_save(instance)) {
         FURI_LOG_E("AimeReader", "Failed to save AIC mode setting");
